@@ -130,8 +130,8 @@
 //! of a collision.
 
 use std::alloc::{Allocator, Layout};
-use std::cell::{Cell, RefCell};
-use std::thread_local;
+
+use std::sync::Mutex;
 
 #[cfg(feature = "tracing")]
 /// Functionality for detailed tracing of allocations. Enabled with the
@@ -250,29 +250,29 @@ impl LocalState {
     }
 }
 
-thread_local! {
-    static ENABLED: Cell<bool> = Cell::new(false);
-    static LOCAL_STATE: RefCell<LocalState> = RefCell::new(LocalState::default());
-}
-
 /// Wraps an existing allocator to allow detecting allocation bugs.
 /// You should use the `#[global_allocator]` attribute to activate
 /// this allocator.
-pub struct Mockalloc<T: Allocator>(pub T);
+pub struct Mockalloc<T: Allocator>(pub T, pub(crate) Mutex<LocalState>);
+
+impl<T: Allocator> Mockalloc<T> {
+    ///
+    pub fn new(t: T) -> Self {
+        Mockalloc(t, Mutex::new(LocalState::default()))
+    }
+}
 
 unsafe impl<T: Allocator> Allocator for Mockalloc<T> {
     fn allocate(&self, layout: Layout) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> {
         let ptr = self.0.allocate(layout);
-        with_local_state(|state| {
-            state.record_alloc(ptr.unwrap().as_mut_ptr(), layout);
-        });
+        let mut state = self.1.lock().unwrap();
+        state.record_alloc(ptr.unwrap().as_mut_ptr(), layout);
         ptr
     }
 
     unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: Layout) {
-        with_local_state(|state| {
-            state.record_free(ptr.as_ptr(), layout);
-        });
+        let mut state = self.1.lock().unwrap();
+        state.record_free(ptr.as_ptr(), layout);
         self.0.deallocate(ptr, layout);
     }
 
@@ -281,9 +281,8 @@ unsafe impl<T: Allocator> Allocator for Mockalloc<T> {
         layout: Layout,
     ) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> {
         let ptr = self.0.allocate_zeroed(layout);
-        with_local_state(|state| {
-            state.record_alloc(ptr.unwrap().as_mut_ptr(), layout);
-        });
+        let mut state = self.1.lock().unwrap();
+        state.record_alloc(ptr.unwrap().as_mut_ptr(), layout);
         ptr
     }
 
@@ -294,10 +293,9 @@ unsafe impl<T: Allocator> Allocator for Mockalloc<T> {
         new_layout: Layout,
     ) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> {
         let new_ptr = self.0.grow(ptr, old_layout, new_layout);
-        with_local_state(|state| {
-            state.record_free(ptr.as_ptr(), old_layout);
-            state.record_alloc(new_ptr.unwrap().as_mut_ptr(), new_layout);
-        });
+        let mut state = self.1.lock().unwrap();
+        state.record_free(ptr.as_ptr(), old_layout);
+        state.record_alloc(new_ptr.unwrap().as_mut_ptr(), new_layout);
         new_ptr
     }
 
@@ -308,10 +306,9 @@ unsafe impl<T: Allocator> Allocator for Mockalloc<T> {
         new_layout: Layout,
     ) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> {
         let new_ptr = self.0.grow_zeroed(ptr, old_layout, new_layout);
-        with_local_state(|state| {
-            state.record_free(ptr.as_ptr(), old_layout);
-            state.record_alloc(new_ptr.unwrap().as_mut_ptr(), new_layout);
-        });
+        let mut state = self.1.lock().unwrap();
+        state.record_free(ptr.as_ptr(), old_layout);
+        state.record_alloc(new_ptr.unwrap().as_mut_ptr(), new_layout);
         new_ptr
     }
 
@@ -322,10 +319,9 @@ unsafe impl<T: Allocator> Allocator for Mockalloc<T> {
         new_layout: Layout,
     ) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> {
         let new_ptr = self.0.shrink(ptr, old_layout, new_layout);
-        with_local_state(|state| {
-            state.record_free(ptr.as_ptr(), old_layout);
-            state.record_alloc(new_ptr.unwrap().as_mut_ptr(), new_layout);
-        });
+        let mut state = self.1.lock().unwrap();
+        state.record_free(ptr.as_ptr(), old_layout);
+        state.record_alloc(new_ptr.unwrap().as_mut_ptr(), new_layout);
         new_ptr
     }
 }
@@ -415,45 +411,31 @@ impl AllocInfo {
 }
 
 ///
-pub struct AllocChecker(bool);
+pub struct AllocChecker<'a, A: Allocator>(&'a Mockalloc<A>);
 
-impl Default for AllocChecker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AllocChecker {
+impl<'a, A: Allocator> AllocChecker<'a, A> {
     ///
-    pub fn new() -> Self {
-        LOCAL_STATE.with(|rc| rc.borrow_mut().start());
-        ENABLED.with(|c| {
-            assert!(!c.get(), "Mockalloc already recording");
-            c.set(true);
-        });
-        Self(true)
+    pub fn new(m: &'a Mockalloc<A>) -> Self {
+        let mut ls = m.1.lock().unwrap();
+        ls.start();
+        Self(m)
     }
 
     ///
-    pub fn finish(mut self) -> AllocInfo {
-        self.0 = false;
-        ENABLED.with(|c| c.set(false));
-        LOCAL_STATE.with(|rc| rc.borrow_mut().finish())
+    pub fn finish(self) -> AllocInfo {
+        self.0 .1.lock().unwrap().finish()
     }
 }
 
-impl Drop for AllocChecker {
+impl<'a, A: Allocator> Drop for AllocChecker<'a, A> {
     fn drop(&mut self) {
-        if self.0 {
-            ENABLED.with(|c| c.set(false));
-            LOCAL_STATE.with(|rc| rc.borrow_mut().finish());
-        }
+        self.0 .1.lock().unwrap().finish();
     }
 }
 
 /// Records the allocations within a code block.
-pub fn record_allocs(f: impl FnOnce()) -> AllocInfo {
-    let checker = AllocChecker::new();
+pub fn record_allocs<A: Allocator>(m: &Mockalloc<A>, f: impl FnOnce()) -> AllocInfo {
+    let checker = AllocChecker::new(m);
     f();
     checker.finish()
 }
@@ -467,11 +449,11 @@ pub fn record_allocs(f: impl FnOnce()) -> AllocInfo {
 ///
 /// If the `tracing` feature is enabled and an error or leak is detected,
 /// this function also prints out the full trace to `stderr`.
-pub fn assert_allocs(f: impl FnOnce()) {
+pub fn assert_allocs<A: Allocator>(m: &Mockalloc<A>, f: impl FnOnce()) {
     if cfg!(miri) {
         f();
     } else {
-        let info = record_allocs(f);
+        let info = record_allocs(m, f);
         #[cfg(feature = "tracing")]
         if info.result.is_err() {
             eprintln!("# Mockalloc trace:\n\n{:#?}", info.tracing);
@@ -480,26 +462,11 @@ pub fn assert_allocs(f: impl FnOnce()) {
     }
 }
 
-/// Returns `true` if allocations are currently being recorded, ie. if
-/// we're inside a call to `record_allocs`.
-pub fn is_recording() -> bool {
-    ENABLED.with(|c| c.get())
-}
-
-fn with_local_state(f: impl FnOnce(&mut LocalState)) {
-    if !is_recording() {
-        return;
-    }
-    ENABLED.with(|c| c.set(false));
-    LOCAL_STATE.with(|rc| f(&mut rc.borrow_mut()));
-    ENABLED.with(|c| c.set(true));
-}
-
 pub use mockalloc_macros::test;
 
 #[cfg(test)]
 mod tests {
-    use super::{is_recording, record_allocs, AllocError, Mockalloc};
+    use super::{record_allocs, AllocError, Mockalloc};
     use std::alloc::{Allocator, Global, Layout};
     use std::{mem, ptr};
 
@@ -510,23 +477,16 @@ mod tests {
             self.0.allocate(layout)
         }
 
-        unsafe fn deallocate(&self, ptr: ptr::NonNull<u8>, layout: Layout) {
-            if !is_recording() {
-                self.0.deallocate(ptr, layout);
-            }
-        }
+        unsafe fn deallocate(&self, _ptr: ptr::NonNull<u8>, _layout: Layout) {}
     }
 
-    // We suppress calls to `dealloc` whilst recording so that our tests don't cause UB
-    // when simulating bad requests to the allocator.
-    static A: Mockalloc<LeakingAllocator> = Mockalloc(LeakingAllocator(Global));
-    type A = &'static Mockalloc<LeakingAllocator>;
+    type M<'a> = &'a Mockalloc<LeakingAllocator>;
 
-    fn do_some_allocations() -> Vec<Box<i32, A>, A> {
-        let mut a = Vec::new_in(&A);
-        let mut b = Vec::new_in(&A);
+    fn do_some_allocations<A: Copy + Allocator>(alloc: A) -> Vec<Box<i32, A>, A> {
+        let mut a = Vec::new_in(alloc);
+        let mut b = Vec::new_in(alloc);
         for i in 0..32 {
-            let p = Box::new_in(i, &A);
+            let p = Box::new_in(i, alloc);
             if i % 2 == 0 {
                 a.push(p);
             } else {
@@ -538,8 +498,9 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let alloc_info = record_allocs(|| {
-            let _p = Box::new_in(42, &A);
+        let m = Mockalloc::new(LeakingAllocator(Global));
+        let alloc_info = record_allocs(&m, || {
+            let _p = Box::new_in(42, &m);
         });
         alloc_info.result().unwrap();
         assert_eq!(alloc_info.num_allocs(), 1);
@@ -550,8 +511,9 @@ mod tests {
 
     #[test]
     fn it_detects_leak() {
-        let alloc_info = record_allocs(|| {
-            mem::forget(Box::new_in(42, &A));
+        let m = Mockalloc::new(LeakingAllocator(Global));
+        let alloc_info = record_allocs(&m, || {
+            mem::forget(Box::new_in(42, &m));
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::Leak);
         assert_eq!(alloc_info.num_allocs(), 1);
@@ -560,8 +522,9 @@ mod tests {
 
     #[test]
     fn it_detects_bad_layout() {
-        let alloc_info = record_allocs(|| unsafe {
-            mem::transmute::<_, Box<f64, A>>(Box::new_in(42u32, &A));
+        let m = Mockalloc::new(LeakingAllocator(Global));
+        let alloc_info = record_allocs(&m, || unsafe {
+            mem::transmute::<_, Box<f64, M>>(Box::new_in(42u32, &m));
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::BadLayout);
         assert_eq!(alloc_info.num_allocs(), 1);
@@ -570,7 +533,8 @@ mod tests {
 
     #[test]
     fn it_detects_no_data() {
-        let alloc_info = record_allocs(|| ());
+        let m = Mockalloc::new(LeakingAllocator(Global));
+        let alloc_info = record_allocs(&m, || ());
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::NoData);
         assert_eq!(alloc_info.num_allocs(), 0);
         assert_eq!(alloc_info.num_frees(), 0);
@@ -578,8 +542,9 @@ mod tests {
 
     #[test]
     fn it_detects_bad_alignment() {
-        let alloc_info = record_allocs(|| unsafe {
-            mem::transmute::<_, Box<[u8; 4], A>>(Box::new_in(42u32, &A));
+        let m = Mockalloc::new(LeakingAllocator(Global));
+        let alloc_info = record_allocs(&m, || unsafe {
+            mem::transmute::<_, Box<[u8; 4], M>>(Box::new_in(42u32, &m));
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::BadAlignment);
         assert_eq!(alloc_info.num_allocs(), 1);
@@ -588,8 +553,9 @@ mod tests {
 
     #[test]
     fn it_detects_bad_size() {
-        let alloc_info = record_allocs(|| unsafe {
-            mem::transmute::<_, Box<[u32; 2], A>>(Box::new_in(42u32, &A));
+        let m = Mockalloc::new(LeakingAllocator(Global));
+        let alloc_info = record_allocs(&m, || unsafe {
+            mem::transmute::<_, Box<[u32; 2], M>>(Box::new_in(42u32, &m));
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::BadSize);
         assert_eq!(alloc_info.num_allocs(), 1);
@@ -598,8 +564,9 @@ mod tests {
 
     #[test]
     fn it_detects_double_free() {
-        let alloc_info = record_allocs(|| unsafe {
-            let mut x = mem::ManuallyDrop::new(Box::new_in(42, &A));
+        let m = Mockalloc::new(LeakingAllocator(Global));
+        let alloc_info = record_allocs(&m, || unsafe {
+            let mut x = mem::ManuallyDrop::new(Box::new_in(42, &m));
             mem::ManuallyDrop::drop(&mut x);
             mem::ManuallyDrop::drop(&mut x);
         });
@@ -610,8 +577,9 @@ mod tests {
 
     #[test]
     fn it_detects_bad_ptr() {
-        let alloc_info = record_allocs(|| unsafe {
-            let mut x = Box::new_in(42, &A);
+        let m = Mockalloc::new(LeakingAllocator(Global));
+        let alloc_info = record_allocs(&m, || unsafe {
+            let mut x = Box::new_in(42, &m);
             *mem::transmute::<_, &mut usize>(&mut x) += 1;
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::BadPtr);
@@ -621,10 +589,11 @@ mod tests {
 
     #[test]
     fn it_works_amongst_many() {
-        let alloc_info = record_allocs(|| {
-            let _unused = do_some_allocations();
-            let _p = Box::new_in(42, &A);
-            let _unused = do_some_allocations();
+        let m = Mockalloc::new(LeakingAllocator(Global));
+        let alloc_info = record_allocs(&m, || {
+            let _unused = do_some_allocations(&m);
+            let _p = Box::new_in(42, &m);
+            let _unused = do_some_allocations(&m);
         });
         alloc_info.result().unwrap();
         assert_eq!(alloc_info.peak_mem(), 964);
@@ -633,74 +602,80 @@ mod tests {
 
     #[test]
     fn it_detects_leak_amongst_many() {
-        let alloc_info = record_allocs(|| {
-            let _unused = do_some_allocations();
-            let p = Box::new_in(42, &A);
-            let _unused = do_some_allocations();
+        let m = Mockalloc::new(LeakingAllocator(Global));
+        let alloc_info = record_allocs(&m, || {
+            let _unused = do_some_allocations(&m);
+            let p = Box::new_in(42, &m);
+            let _unused = do_some_allocations(&m);
             mem::forget(p);
-            let _unused = do_some_allocations();
+            let _unused = do_some_allocations(&m);
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::Leak);
     }
 
     #[test]
     fn it_detects_bad_layout_amongst_many() {
-        let alloc_info = record_allocs(|| unsafe {
-            let _unused = do_some_allocations();
-            let p = Box::new_in(42u32, &A);
-            let _unused = do_some_allocations();
-            mem::transmute::<_, Box<f64, A>>(p);
-            let _unused = do_some_allocations();
+        let m = Mockalloc::new(LeakingAllocator(Global));
+        let alloc_info = record_allocs(&m, || unsafe {
+            let _unused = do_some_allocations(&m);
+            let p = Box::new_in(42u32, &m);
+            let _unused = do_some_allocations(&m);
+            mem::transmute::<_, Box<f64, M>>(p);
+            let _unused = do_some_allocations(&m);
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::BadLayout);
     }
 
     #[test]
     fn it_detects_bad_alignment_amongst_many() {
-        let alloc_info = record_allocs(|| unsafe {
-            let _unused = do_some_allocations();
-            let p = Box::new_in(42u32, &A);
-            let _unused = do_some_allocations();
-            mem::transmute::<_, Box<[u8; 4], A>>(p);
-            let _unused = do_some_allocations();
+        let m = Mockalloc::new(LeakingAllocator(Global));
+        let alloc_info = record_allocs(&m, || unsafe {
+            let _unused = do_some_allocations(&m);
+            let p = Box::new_in(42u32, &m);
+            let _unused = do_some_allocations(&m);
+            mem::transmute::<_, Box<[u8; 4], M>>(p);
+            let _unused = do_some_allocations(&m);
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::BadAlignment);
     }
 
     #[test]
     fn it_detects_bad_size_amongst_many() {
-        let alloc_info = record_allocs(|| unsafe {
-            let _unused = do_some_allocations();
-            let p = Box::new_in(42u32, &A);
-            let _unused = do_some_allocations();
-            mem::transmute::<_, Box<[u32; 2], A>>(p);
-            let _unused = do_some_allocations();
+        let m = Mockalloc::new(LeakingAllocator(Global));
+        let alloc_info = record_allocs(&m, || unsafe {
+            let _unused = do_some_allocations(&m);
+            let p = Box::new_in(42u32, &m);
+            let _unused = do_some_allocations(&m);
+            mem::transmute::<_, Box<[u32; 2], M>>(p);
+            let _unused = do_some_allocations(&m);
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::BadSize);
     }
 
     #[test]
     fn it_detects_double_free_amongst_many() {
-        let alloc_info = record_allocs(|| unsafe {
-            let _unused = do_some_allocations();
-            let mut x = mem::ManuallyDrop::new(Box::new_in(42, &A));
-            let _unused = do_some_allocations();
+        let m = Mockalloc::new(LeakingAllocator(Global));
+        let alloc_info = record_allocs(&m, || unsafe {
+            let _unused = do_some_allocations(&m);
+            let mut x = mem::ManuallyDrop::new(Box::new_in(42, &m));
+            let _unused = do_some_allocations(&m);
             mem::ManuallyDrop::drop(&mut x);
-            let _unused = do_some_allocations();
+            let _unused = do_some_allocations(&m);
             mem::ManuallyDrop::drop(&mut x);
-            let _unused = do_some_allocations();
+            let _unused = do_some_allocations(&m);
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::DoubleFree);
     }
 
     #[test]
     fn it_detects_bad_ptr_amongst_many() {
-        let alloc_info = record_allocs(|| unsafe {
-            let _unused = do_some_allocations();
-            let mut x = Box::new_in(42, &A);
-            let _unused = do_some_allocations();
+        let m = Mockalloc::new(LeakingAllocator(Global));
+        let alloc_info = record_allocs(&m, || unsafe {
+            let _unused = do_some_allocations(&m);
+            let mut x = Box::new_in(42, &m);
+            let _unused = do_some_allocations(&m);
             *mem::transmute::<_, &mut usize>(&mut x) += 1;
-            let _unused = do_some_allocations();
+            let _unused = do_some_allocations(&m);
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::BadPtr);
     }
