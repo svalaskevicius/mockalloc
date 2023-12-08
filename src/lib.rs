@@ -1,3 +1,5 @@
+#![feature(allocator_api)]
+#![feature(slice_ptr_get)]
 #![deny(missing_docs)]
 //! Mockalloc is a crate to allow testing code which uses the global allocator. It
 //! uses a probabilistic algorithm to detect and distinguish several kinds of
@@ -127,7 +129,7 @@
 //! Each accumulator and hash is 128 bits to essentially eliminate the chance
 //! of a collision.
 
-use std::alloc::{GlobalAlloc, Layout};
+use std::alloc::{Allocator, GlobalAlloc, Layout};
 use std::cell::{Cell, RefCell};
 use std::thread_local;
 
@@ -256,42 +258,75 @@ thread_local! {
 /// Wraps an existing allocator to allow detecting allocation bugs.
 /// You should use the `#[global_allocator]` attribute to activate
 /// this allocator.
-pub struct Mockalloc<T: GlobalAlloc>(pub T);
+pub struct Mockalloc<T: Allocator>(pub T);
 
-unsafe impl<T: GlobalAlloc> GlobalAlloc for Mockalloc<T> {
-    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        let ptr = self.0.alloc(layout);
+unsafe impl<T: Allocator> Allocator for Mockalloc<T> {
+    fn allocate(&self, layout: Layout) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> {
+        let ptr = self.0.allocate(layout);
         with_local_state(|state| {
-            state.record_alloc(ptr, layout);
+            state.record_alloc(ptr.unwrap().as_mut_ptr(), layout);
         });
         ptr
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+    unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: Layout) {
         with_local_state(|state| {
-            state.record_free(ptr, layout);
+            state.record_free(ptr.as_ptr(), layout);
         });
-        self.0.dealloc(ptr, layout);
+        self.0.deallocate(ptr, layout);
     }
 
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: the caller must ensure that the `new_size` does not overflow.
-        // `layout.align()` comes from a `Layout` and is thus guaranteed to be valid.
-        let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
-        let new_ptr = self.0.realloc(ptr, layout, new_size);
+    fn allocate_zeroed(
+        &self,
+        layout: Layout,
+    ) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> {
+        let ptr = self.0.allocate_zeroed(layout);
         with_local_state(|state| {
-            state.record_free(ptr, layout);
-            state.record_alloc(new_ptr, new_layout);
+            state.record_alloc(ptr.unwrap().as_mut_ptr(), layout);
+        });
+        ptr
+    }
+
+    unsafe fn grow(
+        &self,
+        ptr: std::ptr::NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> {
+        let new_ptr = self.0.grow(ptr, old_layout, new_layout);
+        with_local_state(|state| {
+            state.record_free(ptr.as_ptr(), old_layout);
+            state.record_alloc(new_ptr.unwrap().as_mut_ptr(), new_layout);
         });
         new_ptr
     }
 
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let ptr = self.0.alloc_zeroed(layout);
+    unsafe fn grow_zeroed(
+        &self,
+        ptr: std::ptr::NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> {
+        let new_ptr = self.0.grow_zeroed(ptr, old_layout, new_layout);
         with_local_state(|state| {
-            state.record_alloc(ptr, layout);
+            state.record_free(ptr.as_ptr(), old_layout);
+            state.record_alloc(new_ptr.unwrap().as_mut_ptr(), new_layout);
         });
-        ptr
+        new_ptr
+    }
+
+    unsafe fn shrink(
+        &self,
+        ptr: std::ptr::NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> {
+        let new_ptr = self.0.shrink(ptr, old_layout, new_layout);
+        with_local_state(|state| {
+            state.record_free(ptr.as_ptr(), old_layout);
+            state.record_alloc(new_ptr.unwrap().as_mut_ptr(), new_layout);
+        });
+        new_ptr
     }
 }
 
@@ -459,56 +494,33 @@ pub use mockalloc_macros::test;
 #[cfg(test)]
 mod tests {
     use super::{is_recording, record_allocs, AllocError, Mockalloc};
-    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::alloc::{Allocator, Global, GlobalAlloc, Layout, System};
     use std::{cmp, mem, ptr};
 
-    struct LeakingAllocator(System);
+    struct LeakingAllocator(Global);
 
-    unsafe impl GlobalAlloc for LeakingAllocator {
-        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            self.0.alloc_zeroed(layout)
+    unsafe impl Allocator for LeakingAllocator {
+        fn allocate(&self, layout: Layout) -> Result<ptr::NonNull<[u8]>, std::alloc::AllocError> {
+            self.0.allocate(layout)
         }
 
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            if is_recording() {
-                // SAFETY: the caller must ensure that the `new_size` does not overflow.
-                // `layout.align()` comes from a `Layout` and is thus guaranteed to be valid.
-                let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
-                // SAFETY: the caller must ensure that `new_layout` is greater than zero.
-                let new_ptr = self.alloc(new_layout);
-                if !new_ptr.is_null() {
-                    // SAFETY: the previously allocated block cannot overlap the newly allocated block.
-                    // The safety contract for `dealloc` must be upheld by the caller.
-                    ptr::copy_nonoverlapping(ptr, new_ptr, cmp::min(layout.size(), new_size));
-                    self.dealloc(ptr, layout);
-                }
-                new_ptr
-            } else {
-                self.0.realloc(ptr, layout, new_size)
-            }
-        }
-
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            self.0.alloc(layout)
-        }
-
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe fn deallocate(&self, ptr: ptr::NonNull<u8>, layout: Layout) {
             if !is_recording() {
-                self.0.dealloc(ptr, layout);
+                self.0.deallocate(ptr, layout);
             }
         }
     }
 
     // We suppress calls to `dealloc` whilst recording so that our tests don't cause UB
     // when simulating bad requests to the allocator.
-    #[global_allocator]
-    static A: Mockalloc<LeakingAllocator> = Mockalloc(LeakingAllocator(System));
+    static A: Mockalloc<LeakingAllocator> = Mockalloc(LeakingAllocator(Global));
+    type A = &'static Mockalloc<LeakingAllocator>;
 
-    fn do_some_allocations() -> Vec<Box<i32>> {
-        let mut a = Vec::new();
-        let mut b = Vec::new();
+    fn do_some_allocations() -> Vec<Box<i32, A>, A> {
+        let mut a = Vec::new_in(&A);
+        let mut b = Vec::new_in(&A);
         for i in 0..32 {
-            let p = Box::new(i);
+            let p = Box::new_in(i, &A);
             if i % 2 == 0 {
                 a.push(p);
             } else {
@@ -521,7 +533,7 @@ mod tests {
     #[test]
     fn it_works() {
         let alloc_info = record_allocs(|| {
-            let _p = Box::new(42);
+            let _p = Box::new_in(42, &A);
         });
         alloc_info.result().unwrap();
         assert_eq!(alloc_info.num_allocs(), 1);
@@ -533,7 +545,7 @@ mod tests {
     #[test]
     fn it_detects_leak() {
         let alloc_info = record_allocs(|| {
-            mem::forget(Box::new(42));
+            mem::forget(Box::new_in(42, &A));
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::Leak);
         assert_eq!(alloc_info.num_allocs(), 1);
@@ -543,7 +555,7 @@ mod tests {
     #[test]
     fn it_detects_bad_layout() {
         let alloc_info = record_allocs(|| unsafe {
-            mem::transmute::<_, Box<f64>>(Box::new(42u32));
+            mem::transmute::<_, Box<f64, A>>(Box::new_in(42u32, &A));
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::BadLayout);
         assert_eq!(alloc_info.num_allocs(), 1);
@@ -561,7 +573,7 @@ mod tests {
     #[test]
     fn it_detects_bad_alignment() {
         let alloc_info = record_allocs(|| unsafe {
-            mem::transmute::<_, Box<[u8; 4]>>(Box::new(42u32));
+            mem::transmute::<_, Box<[u8; 4], A>>(Box::new_in(42u32, &A));
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::BadAlignment);
         assert_eq!(alloc_info.num_allocs(), 1);
@@ -571,7 +583,7 @@ mod tests {
     #[test]
     fn it_detects_bad_size() {
         let alloc_info = record_allocs(|| unsafe {
-            mem::transmute::<_, Box<[u32; 2]>>(Box::new(42u32));
+            mem::transmute::<_, Box<[u32; 2], A>>(Box::new_in(42u32, &A));
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::BadSize);
         assert_eq!(alloc_info.num_allocs(), 1);
@@ -581,7 +593,7 @@ mod tests {
     #[test]
     fn it_detects_double_free() {
         let alloc_info = record_allocs(|| unsafe {
-            let mut x = mem::ManuallyDrop::new(Box::new(42));
+            let mut x = mem::ManuallyDrop::new(Box::new_in(42, &A));
             mem::ManuallyDrop::drop(&mut x);
             mem::ManuallyDrop::drop(&mut x);
         });
@@ -593,7 +605,7 @@ mod tests {
     #[test]
     fn it_detects_bad_ptr() {
         let alloc_info = record_allocs(|| unsafe {
-            let mut x = Box::new(42);
+            let mut x = Box::new_in(42, &A);
             *mem::transmute::<_, &mut usize>(&mut x) += 1;
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::BadPtr);
@@ -605,11 +617,11 @@ mod tests {
     fn it_works_amongst_many() {
         let alloc_info = record_allocs(|| {
             let _unused = do_some_allocations();
-            let _p = Box::new(42);
+            let _p = Box::new_in(42, &A);
             let _unused = do_some_allocations();
         });
         alloc_info.result().unwrap();
-        assert_eq!(alloc_info.peak_mem(), 580);
+        assert_eq!(alloc_info.peak_mem(), 964);
         assert_eq!(alloc_info.peak_mem_allocs(), 52);
     }
 
@@ -617,7 +629,7 @@ mod tests {
     fn it_detects_leak_amongst_many() {
         let alloc_info = record_allocs(|| {
             let _unused = do_some_allocations();
-            let p = Box::new(42);
+            let p = Box::new_in(42, &A);
             let _unused = do_some_allocations();
             mem::forget(p);
             let _unused = do_some_allocations();
@@ -629,9 +641,9 @@ mod tests {
     fn it_detects_bad_layout_amongst_many() {
         let alloc_info = record_allocs(|| unsafe {
             let _unused = do_some_allocations();
-            let p = Box::new(42u32);
+            let p = Box::new_in(42u32, &A);
             let _unused = do_some_allocations();
-            mem::transmute::<_, Box<f64>>(p);
+            mem::transmute::<_, Box<f64, A>>(p);
             let _unused = do_some_allocations();
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::BadLayout);
@@ -641,9 +653,9 @@ mod tests {
     fn it_detects_bad_alignment_amongst_many() {
         let alloc_info = record_allocs(|| unsafe {
             let _unused = do_some_allocations();
-            let p = Box::new(42u32);
+            let p = Box::new_in(42u32, &A);
             let _unused = do_some_allocations();
-            mem::transmute::<_, Box<[u8; 4]>>(p);
+            mem::transmute::<_, Box<[u8; 4], A>>(p);
             let _unused = do_some_allocations();
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::BadAlignment);
@@ -653,9 +665,9 @@ mod tests {
     fn it_detects_bad_size_amongst_many() {
         let alloc_info = record_allocs(|| unsafe {
             let _unused = do_some_allocations();
-            let p = Box::new(42u32);
+            let p = Box::new_in(42u32, &A);
             let _unused = do_some_allocations();
-            mem::transmute::<_, Box<[u32; 2]>>(p);
+            mem::transmute::<_, Box<[u32; 2], A>>(p);
             let _unused = do_some_allocations();
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::BadSize);
@@ -665,7 +677,7 @@ mod tests {
     fn it_detects_double_free_amongst_many() {
         let alloc_info = record_allocs(|| unsafe {
             let _unused = do_some_allocations();
-            let mut x = mem::ManuallyDrop::new(Box::new(42));
+            let mut x = mem::ManuallyDrop::new(Box::new_in(42, &A));
             let _unused = do_some_allocations();
             mem::ManuallyDrop::drop(&mut x);
             let _unused = do_some_allocations();
@@ -679,7 +691,7 @@ mod tests {
     fn it_detects_bad_ptr_amongst_many() {
         let alloc_info = record_allocs(|| unsafe {
             let _unused = do_some_allocations();
-            let mut x = Box::new(42);
+            let mut x = Box::new_in(42, &A);
             let _unused = do_some_allocations();
             *mem::transmute::<_, &mut usize>(&mut x) += 1;
             let _unused = do_some_allocations();
