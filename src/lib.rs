@@ -129,7 +129,7 @@
 //! Each accumulator and hash is 128 bits to essentially eliminate the chance
 //! of a collision.
 
-use std::alloc::{Allocator, GlobalAlloc, Layout};
+use std::alloc::{Allocator, Layout};
 use std::cell::{Cell, RefCell};
 use std::thread_local;
 
@@ -417,6 +417,12 @@ impl AllocInfo {
 ///
 pub struct AllocChecker(bool);
 
+impl Default for AllocChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AllocChecker {
     ///
     pub fn new() -> Self {
@@ -494,8 +500,8 @@ pub use mockalloc_macros::test;
 #[cfg(test)]
 mod tests {
     use super::{is_recording, record_allocs, AllocError, Mockalloc};
-    use std::alloc::{Allocator, Global, GlobalAlloc, Layout, System};
-    use std::{cmp, mem, ptr};
+    use std::alloc::{Allocator, Global, Layout};
+    use std::{mem, ptr};
 
     struct LeakingAllocator(Global);
 
