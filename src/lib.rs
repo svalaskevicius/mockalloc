@@ -379,10 +379,12 @@ impl AllocInfo {
     }
 }
 
-struct AllocChecker(bool);
+///
+pub struct AllocChecker(bool);
 
 impl AllocChecker {
-    fn new() -> Self {
+    ///
+    pub fn new() -> Self {
         LOCAL_STATE.with(|rc| rc.borrow_mut().start());
         ENABLED.with(|c| {
             assert!(!c.get(), "Mockalloc already recording");
@@ -390,7 +392,9 @@ impl AllocChecker {
         });
         Self(true)
     }
-    fn finish(mut self) -> AllocInfo {
+
+    ///
+    pub fn finish(mut self) -> AllocInfo {
         self.0 = false;
         ENABLED.with(|c| c.set(false));
         LOCAL_STATE.with(|rc| rc.borrow_mut().finish())
